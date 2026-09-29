@@ -1,0 +1,622 @@
+<file name="backend/src/config/database.ts">
+import { Pool } from 'pg';
+import Redis from 'redis';
+
+export const pgPool = new Pool({
+  connectionString: process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/shipping_db',
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+});
+
+export const redisClient = Redis.createClient({
+  url: process.env.REDIS_URL || 'redis://localhost:6379'
+});
+
+redisClient.on('error', (err) => console.error('Redis Client Error', err));
+</file>
+
+<file name="backend/src/models/shipment.model.ts">
+export interface Shipment {
+  id: string;
+  userId: string;
+  trackingNumber: string;
+  originAddress: string;
+  destinationAddress: string;
+  weight: number;
+  status: 'PENDING' | 'PICKED_UP' | 'IN_TRANSIT' | 'OUT_FOR_DELIVERY' | 'DELIVERED';
+  currentLocation?: { lat: number; lng: number };
+  estimatedDelivery: Date;
+  createdAt: Date;
+}
+
+export interface CreateShipmentDTO {
+  originAddress: string;
+  destinationAddress: string;
+  weight: number;
+  userId: string;
+}
+</file>
+
+<file name="backend/src/services/shipping.service.ts">
+import { pgPool, redisClient } from '../config/database';
+import { Shipment, CreateShipmentDTO } from '../models/shipment.model';
+import { randomBytes } from 'crypto';
+
+export class ShippingService {
+  async createShipment(dto: CreateShipmentDTO): Promise<Shipment> {
+    const trackingNumber = `SHP-${randomBytes(4).toString('hex').toUpperCase()}`;
+    const query = `
+      INSERT INTO shipments (user_id, tracking_number, origin_address, destination_address, weight, status, estimated_delivery, created_at)
+      VALUES ($1, $2, $3, $4, $5, 'PENDING', NOW() + INTERVAL '3 days', NOW())
+      RETURNING *;
+    `;
+    const values = [dto.userId, trackingNumber, dto.originAddress, dto.destinationAddress, dto.weight];
+    
+    const result = await pgPool.query(query, values);
+    const shipment = result.rows[0];
+    
+    await redisClient.setEx(`tracking:${trackingNumber}`, 86400, JSON.stringify(shipment));
+    return shipment;
+  }
+
+  async calculateCost(weight: number, distanceKm: number): Promise<number> {
+    const baseRate = 10.0;
+    const perKgRate = 2.5;
+    const perKmRate = 0.5;
+    return baseRate + (weight * perKgRate) + (distanceKm * perKmRate);
+  }
+
+  async getShipmentByTracking(trackingNumber: string): Promise<Shipment | null> {
+    const cached = await redisClient.get(`tracking:${trackingNumber}`);
+    if (cached) return JSON.parse(cached);
+
+    const query = 'SELECT * FROM shipments WHERE tracking_number = $1';
+    const result = await pgPool.query(query, [trackingNumber]);
+    
+    if (result.rows.length === 0) return null;
+    
+    const shipment = result.rows[0];
+    await redisClient.setEx(`tracking:${trackingNumber}`, 86400, JSON.stringify(shipment));
+    return shipment;
+  }
+}
+</file>
+
+<file name="backend/src/controllers/shipping.controller.ts">
+import { Request, Response } from 'express';
+import { ShippingService } from '../services/shipping.service';
+
+const shippingService = new ShippingService();
+
+export class ShippingController {
+  async create(req: Request, res: Response): Promise<void> {
+    try {
+      const shipment = await shippingService.createShipment(req.body);
+      res.status(201).json({ success: true, data: shipment });
+    } catch (error: any) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async getByTracking(req: Request, res: Response): Promise<void> {
+    try {
+      const { trackingNumber } = req.params;
+      const shipment = await shippingService.getShipmentByTracking(trackingNumber);
+      
+      if (!shipment) {
+        res.status(404).json({ success: false, error: 'Shipment not found' });
+        return;
+      }
+      
+      res.status(200).json({ success: true, data: shipment });
+    } catch (error: any) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async calculate(req: Request, res: Response): Promise<void> {
+    try {
+      const { weight, distance } = req.body;
+      const cost = await shippingService.calculateCost(Number(weight), Number(distance));
+      res.status(200).json({ success: true, data: { cost, currency: 'USD' } });
+    } catch (error: any) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+}
+</file>
+
+<file name="backend/src/server.ts">
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import { ShippingController } from './controllers/shipping.controller';
+import { pgPool, redisClient } from './config/database';
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(helmet());
+app.use(cors());
+app.use(express.json());
+
+const shippingController = new ShippingController();
+
+app.post('/api/v1/shipments', (req, res) => shippingController.create(req, res));
+app.get('/api/v1/shipments/:trackingNumber', (req, res) => shippingController.getByTracking(req, res));
+app.post('/api/v1/shipments/calculate', (req, res) => shippingController.calculate(req, res));
+
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error(err.stack);
+  res.status(500).json({ success: false, error: 'Internal Server Error' });
+});
+
+async function startServer() {
+  try {
+    await pgPool.connect();
+    await redisClient.connect();
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
+    });
+  } catch (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+startServer();
+</file>
+
+<file name="frontend/lib/core/theme/app_theme.dart">
+import 'package:flutter/material.dart';
+
+class AppTheme {
+  static const Color primary = Color(0xFF1E88E5);
+  static const Color secondary = Color(0xFF26A69A);
+  static const Color background = Color(0xFFF7F9FC);
+  static const Color surface = Colors.white;
+  static const Color error = Color(0xFFD32F2F);
+  static const Color textPrimary = Color(0xFF212121);
+  static const Color textSecondary = Color(0xFF757575);
+
+  static ThemeData get lightTheme {
+    return ThemeData(
+      useMaterial3: true,
+      brightness: Brightness.light,
+      colorScheme: ColorScheme.fromSeed(
+        seedColor: primary,
+        background: background,
+        surface: surface,
+        error: error,
+      ),
+      scaffoldBackgroundColor: background,
+      appBarTheme: const AppBarTheme(
+        backgroundColor: surface,
+        elevation: 0,
+        centerTitle: true,
+        titleTextStyle: TextStyle(
+          color: textPrimary,
+          fontSize: 18,
+          fontWeight: FontWeight.bold,
+        ),
+        iconTheme: IconThemeData(color: textPrimary),
+      ),
+      cardTheme: CardTheme(
+        color: surface,
+        elevation: 2,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        fillColor: Colors.white,
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(8),
+          borderSide: BorderSide.none,
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(8),
+          borderSide: const BorderSide(color: Color(0xFFE0E0E0), width: 1),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(8),
+          borderSide: const BorderSide(color: primary, width: 2),
+        ),
+        errorBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(8),
+          borderSide: const BorderSide(color: error, width: 1),
+        ),
+      ),
+    );
+  }
+}
+</file>
+
+<file name="frontend/lib/features/shipping/data/models/shipment_model.dart">
+class ShipmentModel {
+  final String id;
+  final String trackingNumber;
+  final String originAddress;
+  final String destinationAddress;
+  final double weight;
+  final String status;
+  final DateTime estimatedDelivery;
+
+  ShipmentModel({
+    required this.id,
+    required this.trackingNumber,
+    required this.originAddress,
+    required this.destinationAddress,
+    required this.weight,
+    required this.status,
+    required this.estimatedDelivery,
+  });
+
+  factory ShipmentModel.fromJson(Map<String, dynamic> json) {
+    return ShipmentModel(
+      id: json['id'],
+      trackingNumber: json['tracking_number'],
+      originAddress: json['origin_address'],
+      destinationAddress: json['destination_address'],
+      weight: (json['weight'] as num).toDouble(),
+      status: json['status'],
+      estimatedDelivery: DateTime.parse(json['estimated_delivery']),
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'origin_address': originAddress,
+      'destination_address': destinationAddress,
+      'weight': weight,
+    };
+  }
+}
+</file>
+
+<file name="frontend/lib/features/shipping/presentation/bloc/shipping_state.dart">
+abstract class ShippingState {}
+
+class ShippingInitial extends ShippingState {}
+
+class ShippingLoading extends ShippingState {}
+
+class ShipmentCreated extends ShippingState {
+  final String trackingNumber;
+  ShipmentCreated(this.trackingNumber);
+}
+
+class ShipmentLoaded extends ShippingState {
+  final dynamic shipment;
+  ShipmentLoaded(this.shipment);
+}
+
+class ShippingCostCalculated extends ShippingState {
+  final double cost;
+  ShippingCostCalculated(this.cost);
+}
+
+class ShippingError extends ShippingState {
+  final String message;
+  ShippingError(this.message);
+}
+</file>
+
+<file name="frontend/lib/features/shipping/presentation/bloc/shipping_bloc.dart">
+import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+import 'shipping_state.dart';
+
+class ShippingBloc extends Cubit<ShippingState> {
+  ShippingBloc() : super(ShippingInitial());
+
+  final String baseUrl = 'http://localhost:3000/api/v1/shipments';
+
+  Future<void> createShipment(Map<String, dynamic> data) async {
+    emit(ShippingLoading());
+    try {
+      final response = await http.post(
+        Uri.parse(baseUrl),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(data),
+      );
+
+      if (response.statusCode == 201) {
+        final jsonResponse = jsonDecode(response.body);
+        emit(ShipmentCreated(jsonResponse['data']['tracking_number']));
+      } else {
+        emit(ShippingError('Failed to create shipment'));
+      }
+    } catch (e) {
+      emit(ShippingError(e.toString()));
+    }
+  }
+
+  Future<void> trackShipment(String trackingNumber) async {
+    emit(ShippingLoading());
+    try {
+      final response = await http.get(Uri.parse('$baseUrl/$trackingNumber'));
+
+      if (response.statusCode == 200) {
+        final jsonResponse = jsonDecode(response.body);
+        emit(ShipmentLoaded(jsonResponse['data']));
+      } else {
+        emit(ShippingError('Shipment not found'));
+      }
+    } catch (e) {
+      emit(ShippingError(e.toString()));
+    }
+  }
+
+  Future<void> calculateCost(double weight, double distance) async {
+    emit(ShippingLoading());
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/calculate'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'weight': weight, 'distance': distance}),
+      );
+
+      if (response.statusCode == 200) {
+        final jsonResponse = jsonDecode(response.body);
+        emit(ShippingCostCalculated(jsonResponse['data']['cost']));
+      } else {
+        emit(ShippingError('Calculation failed'));
+      }
+    } catch (e) {
+      emit(ShippingError(e.toString()));
+    }
+  }
+}
+</file>
+
+<file name="frontend/lib/features/shipping/presentation/screens/create_shipment_screen.dart">
+import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import '../bloc/shipping_bloc.dart';
+import '../bloc/shipping_state.dart';
+
+class CreateShipmentScreen extends StatefulWidget {
+  const CreateShipmentScreen({Key? key}) : super(key: key);
+
+  @override
+  State<CreateShipmentScreen> createState() => _CreateShipmentScreenState();
+}
+
+class _CreateShipmentScreenState extends State<CreateShipmentScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _originController = TextEditingController();
+  final _destinationController = TextEditingController();
+  final _weightController = TextEditingController();
+
+  @override
+  void dispose() {
+    _originController.dispose();
+    _destinationController.dispose();
+    _weightController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Create New Shipment')),
+      body: BlocProvider(
+        create: (context) => ShippingBloc(),
+        child: BlocConsumer<ShippingBloc, ShippingState>(
+          listener: (context, state) {
+            if (state is ShipmentCreated) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Shipment created! Tracking: ${state.trackingNumber}')),
+              );
+            } else if (state is ShippingError) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text(state.message), backgroundColor: Colors.red),
+              );
+            }
+          },
+          builder: (context, state) {
+            if (state is ShippingLoading) {
+              return const Center(child: CircularProgressIndicator());
+            }
+
+            return Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Form(
+                key: _formKey,
+                child: ListView(
+                  children: [
+                    TextFormField(
+                      controller: _originController,
+                      decoration: const InputDecoration(labelText: 'Origin Address'),
+                      validator: (value) => value!.isEmpty ? 'Required field' : null,
+                    ),
+                    const SizedBox(height: 16),
+                    TextFormField(
+                      controller: _destinationController,
+                      decoration: const InputDecoration(labelText: 'Destination Address'),
+                      validator: (value) => value!.isEmpty ? 'Required field' : null,
+                    ),
+                    const SizedBox(height: 16),
+                    TextFormField(
+                      controller: _weightController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(labelText: 'Weight (kg)'),
+                      validator: (value) => value!.isEmpty ? 'Required field' : null,
+                    ),
+                    const SizedBox(height: 24),
+                    ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                      ),
+                      onPressed: () {
+                        if (_formKey.currentState!.validate()) {
+                          BlocProvider.of<ShippingBloc>(context).createShipment({
+                            'userId': 'usr_123456',
+                            'originAddress': _originController.text,
+                            'destinationAddress': _destinationController.text,
+                            'weight': double.parse(_weightController.text),
+                          });
+                        }
+                      },
+                      child: const Text('Confirm & Ship'),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+</file>
+
+<file name="frontend/lib/features/shipping/presentation/screens/tracking_screen.dart">
+import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import '../bloc/shipping_bloc.dart';
+import '../bloc/shipping_state.dart';
+
+class TrackingScreen extends StatefulWidget {
+  const TrackingScreen({Key? key}) : super(key: key);
+
+  @override
+  State<TrackingScreen> createState() => _TrackingScreenState();
+}
+
+class _TrackingScreenState extends State<TrackingScreen> {
+  final _trackingController = TextEditingController();
+
+  @override
+  void dispose() {
+    _trackingController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Track Shipment')),
+      body: BlocProvider(
+        create: (context) => ShippingBloc(),
+        child: BlocBuilder<ShippingBloc, ShippingState>(
+          builder: (context, state) {
+            return Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _trackingController,
+                          decoration: const InputDecoration(
+                            labelText: 'Enter Tracking Number',
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      ElevatedButton(
+                        onPressed: () {
+                          if (_trackingController.text.isNotEmpty) {
+                            BlocProvider.of<ShippingBloc>(context)
+                                .trackShipment(_trackingController.text.trim());
+                          }
+                        },
+                        child: const Text('Track'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 24),
+                  if (state is ShippingLoading)
+                    const CircularProgressIndicator()
+                  else if (state is ShipmentLoaded)
+                    Expanded(
+                      child: Card(
+                        child: Padding(
+                          padding: const EdgeInsets.all(16.0),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text('Tracking Number: ${state.shipment['tracking_number']}',
+                                  style: const TextStyle(fontWeight: FontWeight.bold)),
+                              const SizedBox(height: 8),
+                              Text('Status: ${state.shipment['status']}'),
+                              const SizedBox(height: 8),
+                              Text('Origin: ${state.shipment['origin_address']}'),
+                              const SizedBox(height: 8),
+                              Text('Destination: ${state.shipment['destination_address']}'),
+                              const SizedBox(height: 8),
+                              Text('Weight: ${state.shipment['weight']} kg'),
+                            ],
+                          ),
+                        ),
+                      ),
+                    )
+                  else if (state is ShippingError)
+                    Text(state.message, style: const TextStyle(color: Colors.red)),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+</file>
+
+<file name="frontend/lib/main.dart">
+import 'package:flutter/material.dart';
+import 'core/theme/app_theme.dart';
+import 'features/shipping/presentation/screens/create_shipment_screen.dart';
+import 'features/shipping/presentation/screens/tracking_screen.dart';
+
+void main() {
+  runApp(const ShippingApp());
+}
+
+class ShippingApp extends StatefulWidget {
+  const ShippingApp({Key? key}) : super(key: key);
+
+  @override
+  State<ShippingApp> createState() => _ShippingAppState();
+}
+
+class _ShippingAppState extends State<ShippingApp> {
+  int _currentIndex = 0;
+
+  final List<Widget> _screens = [
+    const CreateShipmentScreen(),
+    const TrackingScreen(),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Global Shipping App',
+      theme: AppTheme.lightTheme,
+      home: Scaffold(
+        body: _screens[_currentIndex],
+        bottomNavigationBar: BottomNavigationBar(
+          currentIndex: _currentIndex,
+          onTap: (index) => setState(() => _currentIndex = index),
+          items: const [
+            BottomNavigationBarItem(
+              icon: Icon(Icons.local_shipping),
+              label: 'Ship',
+            ),
+            BottomNavigationBarItem(
+              icon: Icon(Icons.search),
+              label: 'Track',
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+</file>
